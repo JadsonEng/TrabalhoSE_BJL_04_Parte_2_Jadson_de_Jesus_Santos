@@ -18,15 +18,117 @@
 #include "lwip/tcp.h"            // Lightweight IP stack - fornece funções e estruturas para trabalhar com o protocolo TCP
 #include "lwip/netif.h"          // Lightweight IP stack - fornece funções e estruturas para trabalhar com interfaces de rede (netif)
 
-// Credenciais WIFI - Tome cuidado se publicar no github!
-#define WIFI_SSID "SEU_SSID"
-#define WIFI_PASSWORD "SUA_SENHA"
+#include "inc/ssd1306.h"         // Display
 
-// Definição dos pinos dos LEDs
+#include "hardware/i2c.h"
+#include "hardware/timer.h"
+#include "hardware/adc.h"
+#include "hardware/pwm.h"
+#include "hardware/clocks.h"
+
+
+// Credenciais WIFI - Tome cuidado se publicar no github!
+#define WIFI_SSID "Son"
+#define WIFI_PASSWORD "14164881j"
+
+// Definição dos pinos
 #define LED_PIN CYW43_WL_GPIO_LED_PIN   // GPIO do CI CYW43
 #define LED_BLUE_PIN 12                 // GPIO12 - LED azul
 #define LED_GREEN_PIN 11                // GPIO11 - LED verde
 #define LED_RED_PIN 13                  // GPIO13 - LED vermelho
+// Botões
+#define BTN_A 5
+#define BTN_B 6
+#define BTN_JOY 22
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Configurando Joystick
+#define EIXO_Y 26    // ADC0
+#define EIXO_X 27    // ADC1
+#define PWM_WRAP 4095
+
+// Configurando I2C
+#define I2C_PORT i2c1
+#define I2C_SDA 14
+#define I2C_SCL 15
+
+// Configurando Display
+#define DISPLAY_WIDTH 128
+#define DISPLAY_HEIGHT 64
+#define SQUARE_SIZE 8
+
+// Configurando posições do quadrado no display
+int pos_x = (DISPLAY_WIDTH - SQUARE_SIZE) / 2;
+int pos_y = (DISPLAY_HEIGHT - SQUARE_SIZE) / 2;
+const int SPEED = 2;
+const int MAX_X = DISPLAY_WIDTH - SQUARE_SIZE;
+const int MAX_Y = DISPLAY_HEIGHT - SQUARE_SIZE;
+
+// Declarando variáveis globais
+volatile bool pwm_on = false;
+volatile bool borda = false;
+volatile bool led_r_estado = false;
+volatile bool led_g_estado = false;
+volatile bool led_b_estado = false;
+bool cor = true;
+absolute_time_t last_interrupt_time = 0;
+float rpm = 0;
+
+// Protótipos de funções
+void gpio_callback(uint gpio, uint32_t events);
+void JOYSTICK(uint slice1);
+void update_menu(uint8_t *ssd, struct render_area *frame_area);
+
+// Flag
+volatile char c = '~';
+volatile bool new_data = false;
+volatile int current_digit = 0;
+
+// Protótipos das funções
+void npDisplayDigit(int digit);
+
+// Função auxiliar para processar o comando e atualizar os displays
+void process_command(char c, int digit, char *line1, char *line2, uint8_t *ssd, struct render_area *frame_area) {
+    if (BTN_A) {
+    sleep_ms(5);
+    } else {
+        printf("...", c);
+    } 
+
+    // Atualiza o OLED
+    memset(ssd, 0, ssd1306_buffer_length);
+    render_on_display(ssd, frame_area);
+    ssd1306_draw_string(ssd, 5, 0, line1);
+    ssd1306_draw_string(ssd, 5, 8, line2);
+    render_on_display(ssd, frame_area);
+}
+
+
+// Funções para o Buzzer
+
+#define BUZZER 21
+
+void init_pwm(uint gpio) {
+    gpio_set_function(gpio, GPIO_FUNC_PWM); // Configura o GPIO como PWM
+    uint slice_num = pwm_gpio_to_slice_num(gpio);
+    pwm_set_clkdiv(slice_num, 125.0f);     // Define o divisor do clock para 1 MHz
+    pwm_set_wrap(slice_num, 1000);        // Define o TOP para frequência de 1 kHz
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), 0); // Razão cíclica inicial
+    pwm_set_enabled(slice_num, true);     // Habilita o PWM
+}   void set_buzzer_tone(uint gpio, uint freq) {
+    uint slice_num = pwm_gpio_to_slice_num(gpio);
+    uint top = 1000000 / freq;            // Calcula o TOP para a frequência desejada
+    pwm_set_wrap(slice_num, top);
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), top / 2); // 50% duty cycle
+}   void stop_buzzer(uint gpio) {
+    uint slice_num = pwm_gpio_to_slice_num(gpio);
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), 0); // Desliga o PWM
+}
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Inicializar os Pinos GPIO para acionamento dos LEDs da BitDogLab
 void gpio_led_bitdog(void);
@@ -43,11 +145,80 @@ float temp_read(void);
 // Tratamento do request do usuário
 void user_request(char **request);
 
+
 // Função principal
 int main()
 {
     //Inicializa todos os tipos de bibliotecas stdio padrão presentes que estão ligados ao binário.
     stdio_init_all();
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Iniciando e configurando os LEDs
+    gpio_set_function(LED_GREEN_PIN, GPIO_FUNC_PWM);
+    gpio_init(LED_RED_PIN);
+    gpio_init(LED_BLUE_PIN);
+    gpio_set_dir(LED_RED_PIN, GPIO_OUT);
+    gpio_set_dir(LED_BLUE_PIN, GPIO_OUT);
+    gpio_put(LED_RED_PIN, 0);
+    gpio_put(LED_BLUE_PIN, 0);
+
+    // Iniciando e configurando o Buzzer
+    init_pwm(BUZZER);
+
+    //  Iniciando e configurando os botões
+    gpio_init(BTN_A);
+    gpio_init(BTN_B);
+    gpio_init(BTN_JOY);
+    gpio_set_dir(BTN_A, GPIO_IN);
+    gpio_set_dir(BTN_B, GPIO_IN);
+    gpio_set_dir(BTN_JOY, GPIO_IN);
+    gpio_pull_up(BTN_A);
+    gpio_pull_up(BTN_B);
+    gpio_pull_up(BTN_JOY);
+
+    //  Habilitando Interrupção
+    gpio_set_irq_enabled(BTN_A, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(BTN_B, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(BTN_JOY, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_callback(gpio_callback);
+    irq_set_enabled(IO_IRQ_BANK0, true);
+    
+    //  Iniciando ADC
+    adc_init();
+    adc_gpio_init(EIXO_Y);
+    adc_gpio_init(EIXO_X);
+
+    //  Iniciando PWM
+    uint slice1 = pwm_gpio_to_slice_num(LED_GREEN_PIN);
+    pwm_set_wrap(slice1, PWM_WRAP);
+    pwm_set_clkdiv(slice1, 2.0f);
+    pwm_set_enabled(slice1, true);
+
+    // Inicialização do i2c
+    i2c_init(i2c1, ssd1306_i2c_clock * 1000);
+    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA);
+    gpio_pull_up(I2C_SCL);
+
+
+        // Configura a área de renderização do display OLED
+        ssd1306_init();
+
+        struct render_area frame_area = {
+            .start_column = 0,
+            .end_column = ssd1306_width - 1,
+            .start_page = 0,
+            .end_page = ssd1306_n_pages - 1
+        };
+        calculate_render_area_buffer_length(&frame_area);
+    
+        // zera o display inteiro
+        uint8_t ssd[ssd1306_buffer_length];
+        memset(ssd, 0, ssd1306_buffer_length);
+        render_on_display(ssd, &frame_area);
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
     // Inicializar os Pinos GPIO para acionamento dos LEDs da BitDogLab
     gpio_led_bitdog();
@@ -110,6 +281,19 @@ int main()
 
     while (true)
     {
+        JOYSTICK(slice1);    // Lê os eixos do Joystick
+                
+        if (pwm_on) {
+            adc_select_input(1);
+            uint16_t pot_value = adc_read();
+            pwm_set_gpio_level(LED_GREEN_PIN, pot_value);
+        } else {
+            pwm_set_gpio_level(LED_GREEN_PIN, 0);
+        }
+        
+        // Atualiza o menu do display
+        update_menu(ssd, &frame_area);
+        cor = !cor;
         /* 
         * Efetuar o processamento exigido pelo cyw43_driver ou pela stack TCP/IP.
         * Este método deve ser chamado periodicamente a partir do ciclo principal 
@@ -117,6 +301,13 @@ int main()
         */
         cyw43_arch_poll(); // Necessário para manter o Wi-Fi ativo
         sleep_ms(100);      // Reduz o uso da CPU
+
+        if (led_r_estado == true || led_b_estado == true) {
+        set_buzzer_tone(BUZZER, 395);
+        }
+        if (led_r_estado == false && led_b_estado == false) {
+        stop_buzzer(BUZZER);
+        }
     }
 
     //Desligar a arquitetura CYW43.
@@ -133,9 +324,9 @@ void gpio_led_bitdog(void){
     gpio_set_dir(LED_BLUE_PIN, GPIO_OUT);
     gpio_put(LED_BLUE_PIN, false);
     
-    gpio_init(LED_GREEN_PIN);
-    gpio_set_dir(LED_GREEN_PIN, GPIO_OUT);
-    gpio_put(LED_GREEN_PIN, false);
+    //gpio_init(LED_GREEN_PIN);
+    //gpio_set_dir(LED_GREEN_PIN, GPIO_OUT);
+    //gpio_put(LED_GREEN_PIN, false);
     
     gpio_init(LED_RED_PIN);
     gpio_set_dir(LED_RED_PIN, GPIO_OUT);
@@ -152,29 +343,47 @@ static err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 // Tratamento do request do usuário - digite aqui
 void user_request(char **request){
 
-    if (strstr(*request, "GET /blue_on") != NULL)
+    const uint16_t CENTER = 2047;
+    const uint16_t DEADZONE = 170;  // zona morta do Joystick
+    adc_select_input(1);
+    uint16_t x_value = adc_read();    
+    int16_t x_diff = (int16_t)x_value;// - CENTER;
+    float pwm_x = (abs(x_diff) <= DEADZONE) ? 0 : abs(x_diff) ;
+
+    
+    if (strstr(*request, "GET /motor_on") != NULL)
+    {
+        pwm_set_gpio_level(LED_GREEN_PIN, pwm_x);
+        pwm_on = true;
+    }
+    else if (strstr(*request, "GET /motor_off") != NULL)
+    {
+        pwm_set_gpio_level(LED_GREEN_PIN, 0);
+        pwm_on = false;
+    }
+    else if (strstr(*request, "GET /rotor_on") != NULL)
     {
         gpio_put(LED_BLUE_PIN, 1);
+        led_b_estado = true;
+        set_buzzer_tone(BUZZER, 395);
     }
-    else if (strstr(*request, "GET /blue_off") != NULL)
+    else if (strstr(*request, "GET /rotor_off") != NULL)
     {
         gpio_put(LED_BLUE_PIN, 0);
+        led_b_estado = false;
+        stop_buzzer(BUZZER);
     }
-    else if (strstr(*request, "GET /green_on") != NULL)
-    {
-        gpio_put(LED_GREEN_PIN, 1);
-    }
-    else if (strstr(*request, "GET /green_off") != NULL)
-    {
-        gpio_put(LED_GREEN_PIN, 0);
-    }
-    else if (strstr(*request, "GET /red_on") != NULL)
+    else if (strstr(*request, "GET /estator_on") != NULL)
     {
         gpio_put(LED_RED_PIN, 1);
+        led_r_estado = true;
+        set_buzzer_tone(BUZZER, 395);
     }
-    else if (strstr(*request, "GET /red_off") != NULL)
+    else if (strstr(*request, "GET /estator_off") != NULL)
     {
         gpio_put(LED_RED_PIN, 0);
+        led_r_estado = false;
+        stop_buzzer(BUZZER);
     }
     else if (strstr(*request, "GET /on") != NULL)
     {
@@ -192,7 +401,7 @@ float temp_read(void){
     uint16_t raw_value = adc_read();
     const float conversion_factor = 3.3f / (1 << 12);
     float temperature = 27.0f - ((raw_value * conversion_factor) - 0.706f) / 0.001721f;
-        return temperature;
+    return temperature;
 }
 
 // Função de callback para processar requisições HTTP
@@ -218,8 +427,18 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
     // Leitura da temperatura interna
     float temperature = temp_read();
 
+    // Para exibir Tensão
+    const uint16_t CENTRO = 2047;
+    const uint16_t ZONAMORTA = 170;  // zona morta do Joystick
+    adc_select_input(1);
+    uint16_t x_valor = adc_read();    
+    int16_t x_dif = (int16_t)x_valor;// - CENTER;
+    float tensao_valor = (abs(x_dif) <= ZONAMORTA) ? 0 : abs(x_dif);
+    tensao_valor = 440 * (tensao_valor / 4096);
+
     // Cria a resposta HTML
     char html[1024];
+
 
     // Instruções html do webserver
     snprintf(html, sizeof(html), // Formatar uma string e armazená-la em um buffer de caracteres
@@ -229,26 +448,27 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
              "<!DOCTYPE html>\n"
              "<html>\n"
              "<head>\n"
-             "<title> Embarcatech - LED Control </title>\n"
+             "<title> Embarcatech - Motor Monitor </title>\n"
              "<style>\n"
-             "body { background-color: #b5e5fb; font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }\n"
+             "body { background-color:rgb(32, 165, 99); font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }\n"
              "h1 { font-size: 64px; margin-bottom: 30px; }\n"
              "button { background-color: LightGray; font-size: 36px; margin: 10px; padding: 20px 40px; border-radius: 10px; }\n"
              ".temperature { font-size: 48px; margin-top: 30px; color: #333; }\n"
+             ".voltage { font-size: 48px; margin-top: 30px; color: #333; }\n"
              "</style>\n"
              "</head>\n"
              "<body>\n"
-             "<h1>Embarcatech: LED Control</h1>\n"
-             "<form action=\"./blue_on\"><button>Ligar Azul</button></form>\n"
-             "<form action=\"./blue_off\"><button>Desligar Azul</button></form>\n"
-             "<form action=\"./green_on\"><button>Ligar Verde</button></form>\n"
-             "<form action=\"./green_off\"><button>Desligar Verde</button></form>\n"
-             "<form action=\"./red_on\"><button>Ligar Vermelho</button></form>\n"
-             "<form action=\"./red_off\"><button>Desligar Vermelho</button></form>\n"
-             "<p class=\"temperature\">Temperatura Interna: %.2f &deg;C</p>\n"
+             "<h1>Embarcatech: Motor Monitor</h1>\n"
+             "<form action=\"./motor_on\"><button>Ligar Motor</button></form>"
+             "<form action=\"./motor_off\"><button>Desligar Motor</button></form>\n"
+             "<form action=\"./rotor_on\"><button>Falha do Rotor</button></form>"
+             "<form action=\"./rotor_off\"><button>Desligar Rotor</button></form>\n"
+             "<form action=\"./estator_on\"><button>Falha do Estator</button></form>"
+             "<form action=\"./estator_off\"><button>Desligar Estator</button></form>\n"
+             "<p class=\"temperature\">Tensao: %.2f V</p>\n"
              "</body>\n"
              "</html>\n",
-             temperature);
+             tensao_valor);
 
     // Escreve dados para envio (mas não os envia imediatamente).
     tcp_write(tpcb, html, strlen(html), TCP_WRITE_FLAG_COPY);
@@ -265,3 +485,118 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
     return ERR_OK;
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Função de Callback
+void gpio_callback(uint gpio, uint32_t events) {
+    absolute_time_t now = get_absolute_time();
+    int64_t diff = absolute_time_diff_us(last_interrupt_time, now);
+
+    if (diff < 250000) return;
+    last_interrupt_time = now;
+
+    if (gpio == BTN_A) {
+        led_r_estado = !led_r_estado;
+        gpio_put(LED_RED_PIN, led_r_estado);
+        led_r_estado ? printf("Falha no Estator\n") : printf("Estator Normal\n");
+        new_data = true;
+        if(led_r_estado){c = '#';}else{c = '$';}
+    }
+
+    if (gpio == BTN_B) {
+        led_b_estado = !led_b_estado;
+        gpio_put(LED_BLUE_PIN, led_b_estado);
+    }
+    
+    if (gpio == BTN_JOY) {
+        pwm_on = !pwm_on;
+    }
+}
+
+
+// Função do Joystick
+void JOYSTICK(uint slice1) {
+    const uint16_t CENTER = 2047;
+    const uint16_t DEADZONE = 170;  // zona morta do Joystick
+
+    // Lê o eixo Y (ADC0)
+    adc_select_input(0);
+    uint16_t y_value = adc_read();
+    
+    // Lê o eixo X (ADC1)
+    adc_select_input(1);
+    uint16_t x_value = adc_read();
+    
+    int16_t x_diff = (int16_t)x_value;// - CENTER;
+    int16_t y_diff = (int16_t)y_value;// - CENTER;
+
+    // Verificação do pwm em relação a deadzone
+    uint16_t pwm_y = (abs(y_diff) <= DEADZONE) ? 0 : abs(y_diff) ;
+    uint16_t pwm_x = (abs(x_diff) <= DEADZONE) ? 0 : abs(x_diff) ;
+
+    if (pwm_on) {
+    //    rpm = (pwm_x * pwm_y) / 4095;
+    //    if (pwm_x == 0 || pwm_y == 0) {
+    //        rpm = 0;
+    //}
+
+        pwm_set_gpio_level(LED_GREEN_PIN, pwm_x);
+    } else {
+        pwm_set_gpio_level(LED_GREEN_PIN, 0);
+    }
+}
+
+void update_menu(uint8_t *ssd, struct render_area *frame_area) {
+    memset(ssd, 0, ssd1306_buffer_length);
+
+    // Se o LED verde estiver desligado, mostra a mensagem "motor desligado"
+    if (!pwm_on) {
+        ssd1306_draw_string(ssd, 0, 20, "Motor desligado");
+        render_on_display(ssd, frame_area);
+        return;
+    }
+    
+    char motor_status[15];
+    char rotor_status[10];
+    char estator_status[10];
+
+    // Lê o valor do potenciômetro (ADC1) para determinar o estado do motor
+    adc_select_input(1);
+    uint16_t pot_value = adc_read();
+    if (pot_value > 3000) {
+        strcpy(motor_status, "sobretensao");
+    } else if (pot_value < 1000) {
+        strcpy(motor_status, "subtensao");
+    } else {
+        strcpy(motor_status, "normal");
+    }
+
+    // Determina o estado do rotor (LED azul)
+    if (led_b_estado) {
+        strcpy(rotor_status, "falha");
+    } else {
+        strcpy(rotor_status, "normal");
+    }
+
+    // Determina o estado do estator (LED vermelho)
+    if (led_r_estado) {
+        strcpy(estator_status, "falha");
+    } else {
+        strcpy(estator_status, "normal");
+    }
+
+    // Organiza o display em 6 linhas (verticalmente com espaçamento de 10 pixels)
+    ssd1306_draw_string(ssd, 0, 0, "TENSAO");
+    char buffer[30];
+    sprintf(buffer, "  %s", motor_status);
+    ssd1306_draw_string(ssd, 0, 10, buffer);
+
+    ssd1306_draw_string(ssd, 0, 20, "ROTOR");
+    sprintf(buffer, "  %s", rotor_status);
+    ssd1306_draw_string(ssd, 0, 30, buffer);
+
+    ssd1306_draw_string(ssd, 0, 40, "ESTATOR");
+    sprintf(buffer, "  %s", estator_status);
+    ssd1306_draw_string(ssd, 0, 50, buffer);
+
+    render_on_display(ssd, frame_area);
+}

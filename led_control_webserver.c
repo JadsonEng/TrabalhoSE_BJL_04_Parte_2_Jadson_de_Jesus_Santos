@@ -354,37 +354,54 @@ void user_request(char **request){
     if (strstr(*request, "GET /motor_on") != NULL)
     {
         pwm_set_gpio_level(LED_GREEN_PIN, pwm_x);
-        pwm_on = true;
+        pwm_on = !pwm_on;
     }
+    /*
     else if (strstr(*request, "GET /motor_off") != NULL)
     {
         pwm_set_gpio_level(LED_GREEN_PIN, 0);
         pwm_on = false;
     }
+    */
     else if (strstr(*request, "GET /rotor_on") != NULL)
     {
-        gpio_put(LED_BLUE_PIN, 1);
-        led_b_estado = true;
-        set_buzzer_tone(BUZZER, 395);
+        led_b_estado = !led_b_estado;
+        if (led_b_estado == true){
+            gpio_put(LED_BLUE_PIN, true);        
+            set_buzzer_tone(BUZZER, 395);
+        } else {
+            gpio_put(LED_BLUE_PIN, false);
+            stop_buzzer(BUZZER);
+        }
+        
     }
+    /*
     else if (strstr(*request, "GET /rotor_off") != NULL)
     {
         gpio_put(LED_BLUE_PIN, 0);
         led_b_estado = false;
         stop_buzzer(BUZZER);
     }
+    */
     else if (strstr(*request, "GET /estator_on") != NULL)
     {
-        gpio_put(LED_RED_PIN, 1);
-        led_r_estado = true;
-        set_buzzer_tone(BUZZER, 395);
+        led_r_estado = !led_r_estado;
+        if (led_r_estado == true){
+            gpio_put(LED_RED_PIN, true);        
+            set_buzzer_tone(BUZZER, 395);
+        } else {
+            gpio_put(LED_RED_PIN, false);
+            stop_buzzer(BUZZER);
+        }
     }
+    /*
     else if (strstr(*request, "GET /estator_off") != NULL)
     {
         gpio_put(LED_RED_PIN, 0);
         led_r_estado = false;
         stop_buzzer(BUZZER);
     }
+    */
     else if (strstr(*request, "GET /on") != NULL)
     {
         cyw43_arch_gpio_put(LED_PIN, 1);
@@ -436,9 +453,45 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
     float tensao_valor = (abs(x_dif) <= ZONAMORTA) ? 0 : abs(x_dif);
     tensao_valor = 440 * (tensao_valor / 4096);
 
-    // Cria a resposta HTML
-    char html[1024];
+    if (!pwm_on) {
+        tensao_valor = 0;
+    }
 
+    // Determina o estado do motor baseado na tensão
+    char motor_status[15];
+    if (x_valor > 3000) {
+        strcpy(motor_status, "Sobretensao");
+    } else if (x_valor < 1000) {
+        strcpy(motor_status, "Subtensao");
+    } else {
+        strcpy(motor_status, "Normal");
+    }
+
+    // Determina o estado do rotor (LED azul)
+    char rotor_status[10];
+    if (led_b_estado) {
+        strcpy(rotor_status, "Falha");
+    } else {
+        strcpy(rotor_status, "Normal");
+    }
+
+    // Determina o estado do estator (LED vermelho)
+    char estator_status[10];
+    if (led_r_estado) {
+        strcpy(estator_status, "Falha");
+    } else {
+        strcpy(estator_status, "Normal");
+    }
+
+    char ligado[10];
+    if (pwm_on) {
+        strcpy(ligado, "Ligado");
+    } else {
+        strcpy(ligado, "Desligado");
+    }
+
+    // Cria a resposta HTML
+    char html[1024]; // Buffer de tamanho original
 
     // Instruções html do webserver
     snprintf(html, sizeof(html), // Formatar uma string e armazená-la em um buffer de caracteres
@@ -448,27 +501,34 @@ static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, er
              "<!DOCTYPE html>\n"
              "<html>\n"
              "<head>\n"
-             "<title> Embarcatech - Motor Monitor </title>\n"
+             "<title>Embarcatech - Motor Monitor</title>\n"
              "<style>\n"
-             "body { background-color:rgb(32, 165, 99); font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }\n"
-             "h1 { font-size: 64px; margin-bottom: 30px; }\n"
-             "button { background-color: LightGray; font-size: 36px; margin: 10px; padding: 20px 40px; border-radius: 10px; }\n"
-             ".temperature { font-size: 48px; margin-top: 30px; color: #333; }\n"
-             ".voltage { font-size: 48px; margin-top: 30px; color: #333; }\n"
+             "body { background-color:rgb(32, 165, 99); font-family: Arial, sans-serif; text-align: center; margin-top: 20px; }\n"
+             "h1 { font-size: 36px; margin-bottom: 20px; }\n"
+             //"button { background-color: LightGray; font-size: 24px; width: 350px; margin: 15px 0; padding: 20px; border-radius: 8px; }\n"
+             "button {font-size: 24px; width: 350px; padding: 20px; margin: 10px 0; border-radius: 8px;}\n"
+             ".status { font-size: 24px; margin: 15px 0; font-weight: bold; }\n"
+             ".tensao { font-size: 24px; margin: 15px 0; font-weight: bold; }\n"
              "</style>\n"
              "</head>\n"
              "<body>\n"
-             "<h1>Embarcatech: Motor Monitor</h1>\n"
-             "<form action=\"./motor_on\"><button>Ligar Motor</button></form>"
-             "<form action=\"./motor_off\"><button>Desligar Motor</button></form>\n"
-             "<form action=\"./rotor_on\"><button>Falha do Rotor</button></form>"
-             "<form action=\"./rotor_off\"><button>Desligar Rotor</button></form>\n"
-             "<form action=\"./estator_on\"><button>Falha do Estator</button></form>"
-             "<form action=\"./estator_off\"><button>Desligar Estator</button></form>\n"
-             "<p class=\"temperature\">Tensao: %.2f V</p>\n"
+             "<h1>Motor Monitor</h1>\n"
+             
+             "<form action=\"./motor_on\"><button>(ON/OFF) Motor</button></form>\n"
+             "<form action=\"./estator_on\"><button>(ON/OFF) Falha Estator</button></form>\n"
+             "<form action=\"./rotor_on\"><button>(ON/OFF) Falha Rotor</button></form>\n"
+             "<form action=\"./atualiza\"><button>Atualizar</button></form>\n"
+             
+             "<div class=\"status\">Motor: %s</div>\n"
+             "<p class=\"tensao\">Tensao: %.2f V (%s)</p>\n"
+             //"<div class=\"status\">%s</div>\n"
+             "<div class=\"status\">Estator: %s</div>\n"
+             "<div class=\"status\">Rotor: %s</div>\n"
+             
+             
              "</body>\n"
              "</html>\n",
-             tensao_valor);
+             ligado, tensao_valor, motor_status, estator_status, rotor_status);
 
     // Escreve dados para envio (mas não os envia imediatamente).
     tcp_write(tpcb, html, strlen(html), TCP_WRITE_FLAG_COPY);
